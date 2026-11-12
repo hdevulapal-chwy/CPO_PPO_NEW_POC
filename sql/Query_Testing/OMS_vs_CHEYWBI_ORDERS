@@ -1,0 +1,112 @@
+-- Shared cohort: orders selected by EITHER source's date window.
+-- Read OMS source tables directly: the date-filtered test table may omit July.
+-- After selecting orders, match all their shipments without date restrictions.
+-- Adjacent monthly cohorts can overlap; their counts must not be added together.
+-- Coverage means inclusion in comparison, not a guaranteed 100% match rate.
+{% set comparison_query %}
+WITH order_cohort AS (
+    SELECT DISTINCT order_order_id AS order_id
+    FROM edldb.chewybi.order_line_measures
+    WHERE DATE(order_placed_date) BETWEEN '{{ START_DATE }}'::DATE AND '{{ END_DATE }}'::DATE
+      AND order_order_id IS NOT NULL
+    UNION
+    SELECT DISTINCT orders_id AS order_id
+    FROM EDLDB.ORDER_MANAGEMENT_SERVICE.ORDERITEM
+    WHERE DATE(CONVERT_TIMEZONE('UTC', 'America/New_York', TIMECREATED::TIMESTAMP_NTZ))
+          BETWEEN '{{ START_DATE }}'::DATE AND '{{ END_DATE }}'::DATE
+      AND orders_id IS NOT NULL
+),
+target_items AS (
+    SELECT DISTINCT oi.TIMECREATED, oi.id, oi.orders_id, oi.partnumber
+    FROM EDLDB.ORDER_MANAGEMENT_SERVICE.ORDERITEM oi
+    WHERE EXISTS (SELECT 1 FROM order_cohort c WHERE c.order_id = oi.orders_id)
+),
+shipment_items AS (
+    SELECT c.orderitem_id, c.manifest_id, SUM(c.quantity) AS quantity
+    FROM EDLDB.ORDER_MANAGEMENT_SERVICE.ORDITEMCONF c
+    INNER JOIN target_items t ON t.id = c.orderitem_id
+    GROUP BY 1, 2
+),
+oms_rows AS (
+    -- Preserve the original DISTINCT quantity logic.
+    SELECT DISTINCT oi.TIMECREATED, oi.orders_id AS order_id, oi.id AS order_item_id,
+           m.trackingid AS shipment_tracking_number, oi.partnumber, si.quantity
+    FROM target_items oi
+    JOIN shipment_items si ON si.orderitem_id = oi.id
+    JOIN EDLDB.ORDER_MANAGEMENT_SERVICE.MANIFEST m ON m.id = si.manifest_id
+    WHERE m.status <> 'V' AND m.trackingid IS NOT NULL
+),
+a AS (
+    SELECT
+        order_id,
+        shipment_tracking_number,
+        SUM(quantity) AS quantity,
+        COUNT(*) AS source_rows
+    FROM oms_rows
+    GROUP BY 1, 2
+),
+b AS (
+    SELECT
+        b.order_order_id AS order_id,
+        b.shipment_tracking_number,
+        SUM(b.order_line_quantity) AS quantity,
+        COUNT(*) AS source_rows
+    FROM edldb.chewybi.order_line_measures b
+    JOIN order_cohort c ON c.order_id = b.order_order_id
+    WHERE b.shipment_tracking_number IS NOT NULL
+    GROUP BY 1, 2
+),
+comparison AS (
+    SELECT
+        COALESCE(a.order_id, b.order_id) AS order_id,
+        COALESCE(
+            a.shipment_tracking_number,
+            b.shipment_tracking_number
+        ) AS shipment_tracking_number,
+        a.quantity AS oms_quantity,
+        b.quantity AS chewybi_quantity,
+        COALESCE(a.quantity, 0) - COALESCE(b.quantity, 0) AS quantity_difference,
+        a.source_rows AS oms_rows,
+        b.source_rows AS chewybi_rows,
+        CASE
+            WHEN a.source_rows IS NULL THEN 'ONLY_IN_CHEWYBI'
+            WHEN b.source_rows IS NULL THEN 'ONLY_IN_OMS'
+            WHEN a.quantity IS DISTINCT FROM b.quantity
+                THEN 'QUANTITY_MISMATCH'
+            ELSE 'MATCH'
+        END AS comparison_status
+    FROM a
+    FULL OUTER JOIN b
+        ON a.order_id = b.order_id
+        AND a.shipment_tracking_number
+            IS NOT DISTINCT FROM b.shipment_tracking_number
+)
+SELECT * FROM comparison
+{% endset %}
+
+-- Summary includes matches and exceptions, at order + tracking number grain.
+WITH results AS ({{ comparison_query }})
+SELECT
+    '{{ START_DATE }}' AS START_DATE,
+    '{{ END_DATE }}' AS END_DATE,
+    COUNT(*) AS TOTAL_KEYS,
+    COUNT(CASE WHEN comparison_status IN ('MATCH', 'QUANTITY_MISMATCH') THEN 1 END) AS KEYS_IN_BOTH_SOURCES,
+    ROUND(100.0 * COUNT(CASE WHEN comparison_status IN ('MATCH', 'QUANTITY_MISMATCH') THEN 1 END)
+          / NULLIF(COUNT(*), 0), 2) AS KEY_COVERAGE_PCT,
+    COUNT(CASE WHEN comparison_status = 'MATCH' THEN 1 END) AS MATCHED_KEYS,
+    COUNT(CASE WHEN comparison_status <> 'MATCH' THEN 1 END) AS UNMATCHED_KEYS,
+    ROUND(100.0 * COUNT(CASE WHEN comparison_status = 'MATCH' THEN 1 END)
+          / NULLIF(COUNT(*), 0), 2) AS MATCH_RATE_PCT,
+    COUNT(CASE WHEN comparison_status = 'ONLY_IN_OMS' THEN 1 END) AS ONLY_IN_OMS_KEYS,
+    COUNT(CASE WHEN comparison_status = 'ONLY_IN_CHEWYBI' THEN 1 END) AS ONLY_IN_CHEWYBI_KEYS,
+    COUNT(CASE WHEN comparison_status = 'QUANTITY_MISMATCH' THEN 1 END) AS QUANTITY_MISMATCH_KEYS,
+    COALESCE(SUM(oms_quantity), 0) AS OMS_QUANTITY,
+    COALESCE(SUM(chewybi_quantity), 0) AS CHEWYBI_QUANTITY,
+    COALESCE(SUM(oms_quantity), 0) - COALESCE(SUM(chewybi_quantity), 0) AS QUANTITY_DIFFERENCE
+FROM results;
+
+WITH results AS ({{ comparison_query }})
+SELECT * FROM results
+WHERE comparison_status <> 'MATCH'
+ORDER BY comparison_status, order_id, shipment_tracking_number;
+

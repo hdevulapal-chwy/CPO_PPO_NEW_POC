@@ -1,0 +1,216 @@
+-- Step 12: Order Enriched (Receipt-Level)
+-- Grain: ORDER_ID + PRODUCT_PART_NUMBER + STN + RECEIPT_DATE + RECEIPT_DOCUMENT_NUMBER
+--
+-- Core enrichment table. FIFO is the sole source of order lines; OLCM is used
+-- only as a fallback for missing quantity and ORDER_DATE on FIFO rows.
+-- OLCM-only products (products in OLCM but not in FIFO) are NOT added.
+--
+-- Enrichments:
+--   - Shipping FC (WH_ID) from shipment_inspector (ffmcenter_name, source of truth)
+--   - SHIP_DATE from shipment_inspector (source of truth for shipment data)
+--   - Quantity fallback from OLCM when FIFO quantity is NULL/zero
+--   - CONSOLIDATION_ID from step 11
+--   - Product attributes (weight, volume) from chewybi.products
+--   - NETWORK_TYPE from shipment_inspector (Freezer/Pharmacy/Dropship/CORE)
+--   - SHIPMENT_COST from shipment_inspector (source of truth for shipment cost)
+--
+-- Source of truth:
+--   - WH_ID: shipment_inspector.ffmcenter_name (which FC shipped the STN)
+--   - SHIP_DATE: shipment_inspector.actual_ship_date (authoritative)
+--   - SHIPMENT_COST: shipment_inspector.shipment_cost (authoritative)
+--   - NETWORK_TYPE: shipment_inspector.network_type, fallback to CORE_FCs list
+--   - QUANTITY: FIFO preferred, OLCM fallback
+--   - Product dims: chewybi.products
+--
+-- NOTE: OLCM is only used for:
+--   1. Quantity fallback (when FIFO quantity is NULL/zero)
+--   2. ORDER_DATE fallback
+-- All shipment-level attributes (WH_ID, SHIP_DATE, COST, NETWORK_TYPE) come
+-- from shipment_inspector, NOT OLCM.
+--
+-- Incremental: DELETE+INSERT by PLACED_YEAR_MONTH.
+--
+-- Inputs:
+--   - {{ ORDER_BASE_TABLE }} (step 10)
+--   - {{ CONSOLIDATION_REF_TABLE }} (step 11)
+--   - {{ PRODUCTS_TABLE }} (chewybi.products)
+--   - {{ SHIPMENT_INSPECTOR_TABLE }} (WH_ID + shipment cost + network type — source of truth)
+--   - edldb.chewybi.orders (ORDER_KEY lookup)
+--   - edldb.chewybi.order_line_cost_measures (quantity/date fallback)
+
+DELETE FROM {{ ORDER_ENRICHED_TABLE }}
+WHERE PLACED_YEAR_MONTH IN ({{ ORDER_PLACED_YEAR_MONTHS }});
+
+INSERT INTO {{ ORDER_ENRICHED_TABLE }} (
+    ORDER_SKU_STN_HASH,
+    ORDER_ID,
+    CONSOLIDATION_ID,
+    STN,
+    PRODUCT_PART_NUMBER,
+    WH_ID,
+    NETWORK_TYPE,
+    ORDER_DATE,
+    SHIP_DATE,
+    RECEIPT_DATE,
+    RECEIPT_DOCUMENT_NUMBER,
+    QUANTITY,
+    UNIT_WEIGHT_LBS,
+    UNIT_VOLUME_CUFT,
+    TOTAL_WEIGHT_LBS,
+    TOTAL_VOLUME_CUFT,
+    SHIPMENT_COST,
+    WMS_BOX_TYPE,
+    CATSCAN_BOX_TYPE,
+    EFFECTIVE_BOX_TYPE,
+    SOURCE,
+    PLACED_YEAR_MONTH,
+    RUN_TIMESTAMP_UTC
+)
+
+-- Order base for this batch
+WITH orders_base AS (
+    SELECT *
+    FROM {{ ORDER_BASE_TABLE }}
+    WHERE PLACED_YEAR_MONTH IN ({{ ORDER_PLACED_YEAR_MONTHS }})
+),
+
+-- ORDER_KEY lookup for OLCM joins
+order_keys AS (
+    SELECT DISTINCT
+        ORDER_ID::VARCHAR AS ORDER_ID,
+        ORDER_KEY
+    FROM edldb.chewybi.orders
+    WHERE ORDER_ID IN (SELECT DISTINCT ORDER_ID FROM orders_base)
+),
+
+-- Get quantity and dates from OLCM (for quantity fallback and missing product coverage)
+-- Aggregate to ORDER_ID + STN + PRODUCT_PART_NUMBER grain
+-- NOTE: WH_ID no longer comes from OLCM — it comes from shipment_inspector
+olcm_quantities AS (
+    SELECT
+        ord.ORDER_ID,
+        olcm.SHIPMENT_TRACKING_NUMBER AS STN,
+        p.PRODUCT_PART_NUMBER,
+        SUM(ABS(olcm.ORDER_LINE_QUANTITY)) AS ORDER_LINE_QUANTITY,
+        MAX(olcm.ORDER_PLACED_DATE::DATE) AS OLCM_ORDER_DATE
+    FROM edldb.chewybi.order_line_cost_measures olcm
+    JOIN order_keys ord ON olcm.ORDER_KEY = ord.ORDER_KEY
+    JOIN {{ PRODUCTS_TABLE }} p ON olcm.PRODUCT_KEY = p.PRODUCT_KEY
+    GROUP BY ord.ORDER_ID, olcm.SHIPMENT_TRACKING_NUMBER, p.PRODUCT_PART_NUMBER
+),
+
+-- Shipment inspector: source of truth for WH_ID, SHIP_DATE, SHIPMENT_COST, NETWORK_TYPE
+-- Grain: one row per STN
+shipment_inspector AS (
+    SELECT
+        si.shipment_tracking_number AS STN,
+        MAX(si.ffmcenter_name)::VARCHAR AS WH_ID,
+        MAX(si.actual_ship_date::DATE) AS SHIP_DATE,
+        SUM(si.shipment_cost) AS SHIPMENT_COST,
+        MAX(si.network_type) AS NETWORK_TYPE,
+        MAX(si.customer_postcode) AS CUSTOMER_POSTCODE
+    FROM {{ SHIPMENT_INSPECTOR_TABLE }} si
+    WHERE si.shipment_tracking_number IN (
+        SELECT DISTINCT STN FROM orders_base WHERE STN IS NOT NULL
+    )
+    GROUP BY si.shipment_tracking_number
+),
+
+-- FIFO products enriched with OLCM fallbacks for quantity and ORDER_DATE
+-- WH_ID comes from shipment_inspector (shipping FC), NOT OLCM or RECEIPT_FC
+fifo_products AS (
+    SELECT
+        o.ORDER_ID,
+        o.STN,
+        o.PRODUCT_PART_NUMBER,
+        o.RECEIPT_DATE,
+        o.RECEIPT_DOCUMENT_NUMBER,
+        si.WH_ID,
+        COALESCE(o.ORDER_DATE, olcm.OLCM_ORDER_DATE) AS ORDER_DATE,
+        si.SHIP_DATE,
+        COALESCE(o.ORDER_LAYER_QUANTITY, olcm.ORDER_LINE_QUANTITY, 1) AS QUANTITY,
+        o.WMS_BOX_TYPE,
+        o.CATSCAN_BOX_TYPE,
+        o.EFFECTIVE_BOX_TYPE,
+        o.PLACED_YEAR_MONTH,
+        si.SHIPMENT_COST,
+        CASE
+            WHEN si.NETWORK_TYPE IS NOT NULL THEN si.NETWORK_TYPE
+            WHEN si.WH_ID IN ({{ CORE_FCs }}) THEN 'Core'
+            ELSE 'Unknown'
+        END AS NETWORK_TYPE,
+        'FIFO' AS SOURCE
+    FROM orders_base o
+    LEFT JOIN shipment_inspector si
+        ON o.STN = si.STN
+    LEFT JOIN olcm_quantities olcm
+        ON o.ORDER_ID = olcm.ORDER_ID
+        AND o.PRODUCT_PART_NUMBER = olcm.PRODUCT_PART_NUMBER
+        AND COALESCE(o.STN, '') = COALESCE(olcm.STN, '')
+),
+
+-- Get consolidation ID
+consolidation_ref AS (
+    SELECT DISTINCT ORDER_ID, CONSOLIDATION_ID
+    FROM {{ CONSOLIDATION_REF_TABLE }}
+    WHERE PLACED_YEAR_MONTH IN ({{ ORDER_PLACED_YEAR_MONTHS }})
+),
+
+-- Join with products for weight/volume
+orders_enriched AS (
+    SELECT
+        fp.ORDER_ID,
+        fp.STN,
+        fp.PRODUCT_PART_NUMBER,
+        fp.WH_ID,
+        fp.NETWORK_TYPE,
+        fp.ORDER_DATE,
+        fp.SHIP_DATE,
+        fp.RECEIPT_DATE,
+        fp.RECEIPT_DOCUMENT_NUMBER,
+        fp.QUANTITY,
+        fp.SHIPMENT_COST,
+        fp.WMS_BOX_TYPE,
+        fp.CATSCAN_BOX_TYPE,
+        fp.EFFECTIVE_BOX_TYPE,
+        fp.SOURCE,
+        fp.PLACED_YEAR_MONTH,
+        c.CONSOLIDATION_ID,
+        COALESCE(p.PRODUCT_WAREHOUSE_PACKAGED_WEIGHT, 0) AS UNIT_WEIGHT_LBS,
+        COALESCE(
+            p.PRODUCT_WAREHOUSE_PACKAGED_HEIGHT
+            * p.PRODUCT_WAREHOUSE_PACKAGED_WIDTH
+            * p.PRODUCT_WAREHOUSE_PACKAGED_LENGTH / 1728.0, 0
+        ) AS UNIT_VOLUME_CUFT
+    FROM fifo_products fp
+    LEFT JOIN consolidation_ref c
+        ON fp.ORDER_ID = c.ORDER_ID
+    LEFT JOIN {{ PRODUCTS_TABLE }} p
+        ON fp.PRODUCT_PART_NUMBER = p.PRODUCT_PART_NUMBER
+)
+
+SELECT
+    MD5(ORDER_ID || '|' || PRODUCT_PART_NUMBER || '|' || COALESCE(STN, '')) AS ORDER_SKU_STN_HASH,
+    ORDER_ID,
+    CONSOLIDATION_ID,
+    STN,
+    PRODUCT_PART_NUMBER,
+    WH_ID,
+    NETWORK_TYPE,
+    ORDER_DATE,
+    SHIP_DATE,
+    RECEIPT_DATE,
+    RECEIPT_DOCUMENT_NUMBER,
+    QUANTITY,
+    UNIT_WEIGHT_LBS,
+    UNIT_VOLUME_CUFT,
+    QUANTITY * UNIT_WEIGHT_LBS AS TOTAL_WEIGHT_LBS,
+    QUANTITY * UNIT_VOLUME_CUFT AS TOTAL_VOLUME_CUFT,
+    SHIPMENT_COST,
+    WMS_BOX_TYPE,
+    CATSCAN_BOX_TYPE,
+    EFFECTIVE_BOX_TYPE,
+    SOURCE,
+    PLACED_YEAR_MONTH,
+    CURRENT_TIMESTAMP() AS RUN_TIMESTAMP_UTC
+FROM orders_enriched;
